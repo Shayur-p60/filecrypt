@@ -1,0 +1,13 @@
+# Secrets — never commit an actual key
+secret.key
+
+# Encrypted/decrypted artifacts from local testing
+*.encrypted
+*.decrypted
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
