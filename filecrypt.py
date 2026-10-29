@@ -62,7 +62,7 @@ def load_key(key_path: str = DEFAULT_KEY_FILE) -> bytes:
 
 
 def encrypt_file(filepath: str, key: bytes) -> str:
-    """Encrypts filepath in place and returns the new file's path.
+    """Encrypts filepath to a separate copy and returns the copy's path.
 
     The original file is left untouched; the encrypted copy is written
     to '<filepath>.encrypted'.
@@ -106,33 +106,92 @@ def decrypt_file(filepath: str, key: bytes) -> str:
     return output_path
 
 
+def _write_bytes(path: str, data: bytes) -> None:
+    """Writes data to path and flushes it to disk before returning."""
+    with open(path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _remove_if_exists(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
 def rotate_key(directory: str = ".", key_path: str = DEFAULT_KEY_FILE) -> tuple[bytes, list[str]]:
     """Rotates the encryption key: generates a fresh key and re-encrypts
     every '*.encrypted' file in `directory` under it, so nothing already
     encrypted becomes unreadable.
 
+    The rotation is ordered so a failure can't strand files under an
+    unsaved key:
+      1. Every file is decrypted with the old key first. If any fails
+         (e.g. InvalidToken), nothing has been written yet.
+      2. Each file is re-encrypted to '<name>.encrypted.tmp'.
+      3. The old key is backed up to '<key_path>.bak', then the new key
+         is written.
+      4. Only then is each original replaced by its temp file via
+         os.replace(), which is atomic.
+    A failure before step 4 removes the temp files and leaves the
+    original files and key as they were.
+
     Returns (new_key, list_of_rotated_filepaths).
     """
     old_key = load_key(key_path)
     old_fernet = Fernet(old_key)
+
+    paths = [
+        os.path.join(directory, name)
+        for name in sorted(os.listdir(directory))
+        if name.endswith(ENCRYPTED_SUFFIX)
+    ]
+
+    # Step 1: make sure the old key opens every file before touching anything.
+    # Raises InvalidToken if any file was encrypted under a different key.
+    for path in paths:
+        with open(path, "rb") as f:
+            old_fernet.decrypt(f.read())
+
     new_key = Fernet.generate_key()
     new_fernet = Fernet(new_key)
+    tmp_paths = []
+    key_tmp_path = key_path + ".tmp"
 
+    try:
+        # Step 2: write re-encrypted copies next to the originals.
+        for path in paths:
+            with open(path, "rb") as f:
+                plaintext = old_fernet.decrypt(f.read())
+            tmp_path = path + ".tmp"
+            tmp_paths.append(tmp_path)
+            _write_bytes(tmp_path, new_fernet.encrypt(plaintext))
+
+        # Step 3: back up the old key, then swap in the new one atomically.
+        _write_bytes(key_path + ".bak", old_key)
+        _write_bytes(key_tmp_path, new_key)
+        os.replace(key_tmp_path, key_path)
+    except BaseException:
+        for tmp_path in tmp_paths:
+            _remove_if_exists(tmp_path)
+        _remove_if_exists(key_tmp_path)
+        raise
+
+    # Step 4: the new key is saved, so it's now safe to swap in the new files.
     rotated = []
-    for name in os.listdir(directory):
-        if not name.endswith(ENCRYPTED_SUFFIX):
-            continue
-        full_path = os.path.join(directory, name)
-        with open(full_path, "rb") as f:
-            data = f.read()
-        plaintext = old_fernet.decrypt(data)  # will raise InvalidToken if it wasn't ours
-        re_encrypted = new_fernet.encrypt(plaintext)
-        with open(full_path, "wb") as f:
-            f.write(re_encrypted)
-        rotated.append(full_path)
-
-    with open(key_path, "wb") as f:
-        f.write(new_key)
+    for path, tmp_path in zip(paths, tmp_paths):
+        try:
+            os.replace(tmp_path, path)
+        except OSError as e:
+            raise OSError(
+                f"Rotation stopped while replacing '{path}': {e}. The new key "
+                f"is in '{key_path}' and the old key is in '{key_path}.bak'. "
+                f"Files already replaced use the new key; the rest still use "
+                f"the old key, with new-key copies left as '*.encrypted.tmp'."
+            ) from e
+        rotated.append(path)
 
     return new_key, rotated
 
@@ -175,7 +234,13 @@ def _cli_rotate_key(args):
         print(f"Key rotated. Re-encrypted {len(rotated)} file(s):")
         for path in rotated:
             print(f"  - {path}")
-    except (FileNotFoundError, InvalidToken) as e:
+    except InvalidToken:
+        print(
+            "Error: a .encrypted file could not be decrypted with the current key "
+            "(wrong key or corrupted). Nothing was changed."
+        )
+        sys.exit(1)
+    except OSError as e:
         print(f"Error: {e}")
         sys.exit(1)
 

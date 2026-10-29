@@ -105,3 +105,91 @@ def test_rotate_key_with_no_encrypted_files(tmp_path, key_path):
     filecrypt.generate_key(key_path)
     new_key, rotated = filecrypt.rotate_key(directory=str(tmp_path), key_path=key_path)
     assert rotated == []
+
+
+# --- rotate_key safety -------------------------------------------------------
+
+def _snapshot(directory):
+    """Maps every file name in directory to its bytes."""
+    return {
+        name: (directory / name).read_bytes()
+        for name in os.listdir(directory)
+    }
+
+
+def _tmp_files(directory):
+    return [name for name in os.listdir(directory) if name.endswith(".tmp")]
+
+
+@pytest.fixture
+def encrypted_files(tmp_path, key_path):
+    """Two files encrypted under the key at key_path. Returns (key, {path: plaintext})."""
+    key = filecrypt.generate_key(key_path)
+    contents = {"a.txt": b"alpha contents", "b.txt": b"bravo contents"}
+    encrypted = {}
+    for name, data in contents.items():
+        plain = tmp_path / name
+        plain.write_bytes(data)
+        encrypted[filecrypt.encrypt_file(str(plain), key)] = data
+        plain.unlink()  # only the .encrypted copies should matter
+    return key, encrypted
+
+
+def test_rotate_key_success_rotates_every_file(tmp_path, key_path, encrypted_files):
+    old_key, encrypted = encrypted_files
+
+    new_key, rotated = filecrypt.rotate_key(directory=str(tmp_path), key_path=key_path)
+
+    assert sorted(rotated) == sorted(encrypted)
+    assert filecrypt.load_key(key_path) == new_key != old_key
+    assert filecrypt.load_key(key_path + ".bak") == old_key
+    for path, data in encrypted.items():
+        with open(path, "rb") as f:
+            assert Fernet(new_key).decrypt(f.read()) == data
+    assert _tmp_files(tmp_path) == []
+
+
+def test_rotate_key_aborts_when_a_file_uses_a_different_key(
+    tmp_path, key_path, encrypted_files, monkeypatch
+):
+    foreign = tmp_path / "c.txt.encrypted"
+    foreign.write_bytes(Fernet(Fernet.generate_key()).encrypt(b"someone else's"))
+    before = _snapshot(tmp_path)
+
+    # Force the foreign file to come last, so a rotation that rewrites as it
+    # goes would already have changed a and b before failing.
+    real_listdir = os.listdir
+    monkeypatch.setattr(
+        filecrypt.os, "listdir",
+        lambda d: sorted(real_listdir(d), key=lambda n: n == foreign.name),
+    )
+
+    with pytest.raises(InvalidToken):
+        filecrypt.rotate_key(directory=str(tmp_path), key_path=key_path)
+
+    # Every file (originals and key) is byte-for-byte unchanged, nothing added.
+    assert _snapshot(tmp_path) == before
+    assert not os.path.exists(key_path + ".bak")
+    assert _tmp_files(tmp_path) == []
+
+
+def test_rotate_key_failure_while_writing_cleans_up_tmp_files(
+    tmp_path, key_path, encrypted_files, monkeypatch
+):
+    before = _snapshot(tmp_path)
+    real_write = filecrypt._write_bytes
+    calls = []
+
+    def write_then_fail(path, data):
+        calls.append(path)
+        if len(calls) == 2:  # first temp file written, second hits "disk full"
+            raise OSError("No space left on device")
+        real_write(path, data)
+
+    monkeypatch.setattr(filecrypt, "_write_bytes", write_then_fail)
+
+    with pytest.raises(OSError):
+        filecrypt.rotate_key(directory=str(tmp_path), key_path=key_path)
+
+    assert _snapshot(tmp_path) == before
+    assert _tmp_files(tmp_path) == []

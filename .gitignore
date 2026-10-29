@@ -1,8 +1,11 @@
 # Secrets — never commit an actual key
 secret.key
+secret.key.bak
+secret.key.tmp
 
 # Encrypted/decrypted artifacts from local testing
 *.encrypted
+*.encrypted.tmp
 *.decrypted
 
 # Python
