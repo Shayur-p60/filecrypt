@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filecrypt"
+version = "0.2.0"
+description = "Encrypt and decrypt files with Fernet, using a key file or a password."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Shayur-p60" }]
+dependencies = ["cryptography>=42"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+filecrypt = "filecrypt:main"
+
+[tool.setuptools]
+py-modules = ["filecrypt"]
